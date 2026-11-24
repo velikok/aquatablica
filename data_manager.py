@@ -7,9 +7,11 @@ import io
 import zipfile
 import sqlite3
 import html
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import xml.etree.ElementTree as ET
 import requests
+
+MSK_TZ = timezone(timedelta(hours=3))
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 DB_PATH = os.path.join(os.path.dirname(__file__), "staff.db")
@@ -212,31 +214,41 @@ class StaffDataManager:
                 if not nick or '_' not in str(nick) or str(nick).strip().startswith('Ник'):
                     continue
                     
+                def _cstr(col, default="-"):
+                    val = r.get(col)
+                    if val is None:
+                        return default
+                    s = str(val).strip()
+                    return s if s else default
+
                 clean_nick = str(nick).strip()
-                lvl = str(r.get(2, '-')).replace('.0', '').strip()
-                role = str(r.get(3, '-')).strip()
-                inactive = str(r.get(5, '-')).replace('.0', '').strip()
-                no_norm = str(r.get(6, '-')).replace('.0', '').strip()
-                norm_days = str(r.get(7, '-')).replace('.0', '').strip()
-                oral_rep = str(r.get(8, '-')).strip()
-                warn_rep = str(r.get(9, '-')).strip()
-                strict_rep = str(r.get(10, '-')).strip()
-                tokens = str(r.get(11, '-')).replace('.0', '').strip()
-                points = str(r.get(12, '-')).replace('.0', '').strip()
-                immune_warn = str(r.get(13, '-')).strip()
-                immune_rep = str(r.get(14, '-')).strip()
+                lvl = _cstr(2).replace('.0', '').strip()
+                role = _cstr(3)
+                inactive = _cstr(5).replace('.0', '').strip()
+                no_norm = _cstr(6).replace('.0', '').strip()
+                norm_days = _cstr(7).replace('.0', '').strip()
+                oral_rep = _cstr(8)
+                warn_rep = _cstr(9)
+                strict_rep = _cstr(10)
+                tokens = _cstr(11).replace('.0', '').strip()
+                points = _cstr(12).replace('.0', '').strip()
+                immune_warn = _cstr(13)
+                immune_rep = _cstr(14)
                 last_prom = excel_date_to_str(r.get(15))
                 appointed = excel_date_to_str(r.get(16))
                 
-                # Telegram metadata
-                tg_username = str(r.get(44, '')).strip().lstrip('@')
-                raw_tg_id = str(r.get(45, '')).strip()
+                # Telegram metadata (safe None handling)
+                val_44 = r.get(44)
+                tg_username = str(val_44).strip().lstrip('@') if val_44 is not None else ""
+                val_45 = r.get(45)
+                raw_tg_id = str(val_45).strip() if val_45 is not None else ""
                 clean_tg_id = ""
                 if raw_tg_id and raw_tg_id != '-':
                     try:
                         clean_tg_id = str(int(float(raw_tg_id)))
                     except Exception:
-                        clean_tg_id = raw_tg_id.split('.')[0]
+                        digits = ''.join(ch for ch in raw_tg_id.split('.')[0] if ch.isdigit())
+                        clean_tg_id = digits
                 
                 # Calculate days on post
                 days_on_post = None
@@ -268,14 +280,14 @@ class StaffDataManager:
                 new_by_nick[clean_nick.lower()] = info
                 if tg_username and tg_username != '-':
                     new_by_username[tg_username.lower()] = info
-                if clean_tg_id and clean_tg_id != '-':
+                if clean_tg_id and clean_tg_id.isdigit():
                     new_by_tg_id[clean_tg_id] = info
                     
             self.admins_by_nick = new_by_nick
             self.admins_by_tg_id = new_by_tg_id
             self.admins_by_username = new_by_username
             self.last_update_ts = time.time()
-            self.last_update_str = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+            self.last_update_str = datetime.now(MSK_TZ).strftime("%d.%m.%Y %H:%M:%S (МСК)")
             
             print(f"[StaffData] Успешно загружено администраторов: {len(new_by_nick)}")
             return True, f"Загружено {len(new_by_nick)} администраторов"
@@ -285,38 +297,9 @@ class StaffDataManager:
             return False, str(e)
 
     def find_admin_for_telegram_user(self, telegram_id, telegram_username=None):
+        """Строгая проверка доступа: ТОЛЬКО по точному совпадению TG ID в таблице."""
         str_id = str(telegram_id)
-        
-        # 1. Check known built-in bindings (e.g. Owner/Curators)
-        builtin_links = {
-            1399524277: "toshiro_forester",
-            5594041416: "den_celov"
-        }
-        if telegram_id in builtin_links:
-            b_nick = builtin_links[telegram_id]
-            if b_nick in self.admins_by_nick:
-                return self.admins_by_nick[b_nick]
-
-        # 2. Check SQLite explicit links
-        db_nick = db_get_linked_nick(telegram_id)
-        if db_nick and db_nick.lower() in self.admins_by_nick:
-            return self.admins_by_nick[db_nick.lower()]
-            
-        # 3. Check TG ID from sheet
-        if str_id in self.admins_by_tg_id:
-            adm = self.admins_by_tg_id[str_id]
-            db_set_link(telegram_id, adm["nick"], telegram_username)
-            return adm
-            
-        # 4. Check Telegram username from sheet
-        if telegram_username:
-            u_clean = telegram_username.lower().lstrip('@')
-            if u_clean in self.admins_by_username:
-                adm = self.admins_by_username[u_clean]
-                db_set_link(telegram_id, adm["nick"], telegram_username)
-                return adm
-                
-        return None
+        return self.admins_by_tg_id.get(str_id)
 
     def search_by_nick(self, query):
         clean_q = query.strip().lower()
@@ -334,16 +317,13 @@ class StaffDataManager:
         lvl = html.escape(str(adm.get("lvl", "-")))
         role = html.escape(str(adm.get("role", "-")))
         
-        appointed = adm.get("appointed", "-")
-        days = adm.get("days_on_post")
-        days_str = f" <i>(на посту: {days} дн.)</i>" if days is not None and days >= 0 else ""
+        appointed = html.escape(str(adm.get("appointed", "-")))
+        last_prom = html.escape(str(adm.get("last_prom", "-")))
+        prom_str = f"\n📈 <b>Последнее повышение:</b> {last_prom}" if last_prom and last_prom != '-' else ""
         
-        last_prom = adm.get("last_prom", "-")
-        prom_str = f"\n📈 <b>Посл. повышение:</b> {last_prom}" if last_prom and last_prom != '-' else ""
-        
-        points = adm.get("points", "-")
-        tokens = adm.get("tokens", "-")
-        norm_days = adm.get("norm_days", "-")
+        points = html.escape(str(adm.get("points", "-")))
+        tokens = html.escape(str(adm.get("tokens", "-")))
+        norm_days = html.escape(str(adm.get("norm_days", "-")))
         
         oral = html.escape(str(adm.get("oral_rep", "0 из 2")))
         warn = html.escape(str(adm.get("warn_rep", "0 из 2")))
@@ -356,18 +336,18 @@ class StaffDataManager:
         imm_rep = html.escape(str(adm.get("immune_rep", "-")))
 
         text = (
-            f"📋 <b>ДОСЬЕ АДМИНИСТРАТОРА:</b> <code>{nick}</code>\n\n"
+            f"📋 <b>Информация об администраторе:</b> <code>{nick}</code>\n\n"
             f"👤 <b>Должность:</b> {role} <b>({lvl} lvl)</b>\n"
-            f"📅 <b>Дата назначения:</b> {appointed}{days_str}{prom_str}\n\n"
+            f"📅 <b>Дата назначения:</b> {appointed}{prom_str}\n\n"
+            f"📊 <b>Дней с нормой:</b> <code>{norm_days}</code>\n"
             f"🏆 <b>Баллы:</b> <code>{points}</code>\n"
             f"⭐️ <b>Токены:</b> <code>{tokens}</code>\n"
-            f"📊 <b>Дней с нормой:</b> <code>{norm_days}</code>\n\n"
-            f"⚠️ <b>ТЕКУЩИЕ НАКАЗАНИЯ:</b>\n"
+            f"🏖 <b>Неактивы:</b> <code>{inactive}</code> | <b>Нет нормы:</b> <code>{no_norm}</code>\n\n"
+            f"⚠️ <b>Наказания:</b>\n"
             f"• Устные предупреждения: <b>{oral}</b>\n"
             f"• Предупреждения: <b>{warn}</b>\n"
             f"• Строгие выговоры: <b>{strict}</b>\n\n"
-            f"🏖 <b>Неактивы:</b> {inactive} | <b>Нет нормы:</b> {no_norm}\n"
-            f"🛡 <b>Иммунитеты:</b> Пред: <code>{imm_warn}</code> | Выговор: <code>{imm_rep}</code>"
+            f"🛡 <b>Иммунитеты:</b> Пред — <code>{imm_warn}</code> | Выговор — <code>{imm_rep}</code>"
         )
         return text
 

@@ -119,6 +119,15 @@ def get_card_inline_keyboard():
     markup.add(btn_reload)
     return markup
 
+def _deny_access(user_id):
+    """Отказ в доступе и удаление клавиатуры, если Telegram ID не найден в таблице."""
+    user_states.pop(user_id, None)
+    text = (
+        "⛔ <b>Доступ запрещён.</b>\n\n"
+        f"Ваш Telegram ID (<code>{user_id}</code>) не найден в таблице администрации."
+    )
+    _safe_send_message(user_id, text, reply_markup=types.ReplyKeyboardRemove())
+
 # --- Handlers ---
 
 @bot.message_handler(commands=['start', 'help'])
@@ -128,24 +137,17 @@ def cmd_start(message):
     user_states.pop(user_id, None)
 
     adm = staff_mgr.find_admin_for_telegram_user(user_id, username)
-    
-    if adm:
-        kb = get_main_keyboard(user_id, adm)
-        text = (
-            f"👋 Привет, <b>{adm['nick']}</b>!\n"
-            f"Твой профиль успешно распознан в таблице администрации.\n\n"
-            f"Нажми кнопку <b>[📊 Моя статистика]</b> ниже, чтобы просмотреть своё актуальное досье."
-        )
-        _safe_send_message(user_id, text, reply_markup=kb)
-    else:
-        # Prompt for nickname
-        user_states[user_id] = "WAITING_NICK"
-        text = (
-            "👋 Приветствую!\n\n"
-            "Твой Telegram аккаунт пока не привязан к таблице состава администрации.\n\n"
-            "✏️ Напиши свой точный <b>игровой Nick_Name</b> в ответ (например: <code>Ivan_Ivanov</code>):"
-        )
-        _safe_send_message(user_id, text)
+    if not adm:
+        _deny_access(user_id)
+        return
+
+    kb = get_main_keyboard(user_id, adm)
+    text = (
+        f"👋 Привет, <b>{adm['nick']}</b>!\n"
+        f"Твой профиль успешно распознан в таблице администрации.\n\n"
+        f"Нажми кнопку <b>[📊 Моя статистика]</b> ниже, чтобы просмотреть актуальную информацию о себе."
+    )
+    _safe_send_message(user_id, text, reply_markup=kb)
 
 @bot.message_handler(func=lambda msg: msg.text in ["📊 Моя статистика", "/my", "/stats", "/stat", "/me"])
 def cmd_my_stats(message):
@@ -155,23 +157,26 @@ def cmd_my_stats(message):
 
     adm = staff_mgr.find_admin_for_telegram_user(user_id, username)
     if not adm:
-        user_states[user_id] = "WAITING_NICK"
-        _safe_send_message(
-            user_id,
-            "⚠️ Твой игровой никнейм не найден.\n\n"
-            "Пожалуйста, отправь свой <b>Nick_Name</b> (например: <code>Ivan_Ivanov</code>):"
-        )
+        _deny_access(user_id)
         return
 
     card = staff_mgr.format_card(adm)
-    card += f"\n\n🕒 <i>Синхронизировано: {staff_mgr.last_update_str}</i>"
+    card += f"\n\n🕒 <i>Последнее обновление таблицы: {staff_mgr.last_update_str}</i>"
     inline_kb = get_card_inline_keyboard()
     _safe_send_message(user_id, card, reply_markup=inline_kb)
 
-@bot.message_handler(func=lambda msg: msg.text == "🔍 Найти админа" or msg.text.startswith("/find") or msg.text.startswith("/check"))
+@bot.message_handler(func=lambda msg: msg.text == "🔍 Найти админа" or (msg.text and (msg.text.startswith("/find") or msg.text.startswith("/check"))))
 def cmd_find_admin(message):
     user_id = message.from_user.id
     username = message.from_user.username
+
+    adm_caller = staff_mgr.find_admin_for_telegram_user(user_id, username)
+    if not adm_caller:
+        _deny_access(user_id)
+        return
+    if not is_senior_admin(user_id, adm_caller):
+        _safe_send_message(user_id, "⛔ Данная функция доступна только руководству администрации.")
+        return
     
     # Check if arguments provided in command
     parts = message.text.split(maxsplit=1)
@@ -180,7 +185,7 @@ def cmd_find_admin(message):
         adm = staff_mgr.search_by_nick(target_query)
         if adm:
             card = staff_mgr.format_card(adm)
-            card += f"\n\n🕒 <i>Данные из таблицы: {staff_mgr.last_update_str}</i>"
+            card += f"\n\n🕒 <i>Последнее обновление таблицы: {staff_mgr.last_update_str}</i>"
             _safe_send_message(user_id, card)
         else:
             _safe_send_message(user_id, f"❌ Администратор с ником <code>{target_query}</code> не найден в таблице.")
@@ -193,6 +198,9 @@ def cmd_find_admin(message):
 def cmd_refresh_data(message):
     user_id = message.from_user.id
     adm = staff_mgr.find_admin_for_telegram_user(user_id, message.from_user.username)
+    if not adm:
+        _deny_access(user_id)
+        return
     if not is_senior_admin(user_id, adm):
         _safe_send_message(user_id, "⛔ Данная функция доступна только руководству администрации.")
         return
@@ -218,13 +226,21 @@ def cb_refresh_my_card(call):
     user_id = call.from_user.id
     username = call.from_user.username
     
+    # Smart throttle: if last update was more than 30 seconds ago, fetch fresh data
+    if time.time() - staff_mgr.last_update_ts > 30:
+        staff_mgr.fetch_and_parse()
+        
     adm = staff_mgr.find_admin_for_telegram_user(user_id, username)
     if not adm:
-        bot.answer_callback_query(call.id, "Профиль не найден! Отправь /start", show_alert=True)
+        bot.answer_callback_query(call.id, "⛔ Доступ запрещён. Ваш Telegram ID отсутствует в таблице.", show_alert=True)
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
         return
         
     card = staff_mgr.format_card(adm)
-    card += f"\n\n🕒 <i>Синхронизировано: {staff_mgr.last_update_str}</i>"
+    card += f"\n\n🕒 <i>Последнее обновление таблицы: {staff_mgr.last_update_str}</i>"
     inline_kb = get_card_inline_keyboard()
     
     try:
@@ -237,57 +253,41 @@ def cb_refresh_my_card(call):
 def handle_text(message):
     user_id = message.from_user.id
     username = message.from_user.username
+    
+    adm_caller = staff_mgr.find_admin_for_telegram_user(user_id, username)
+    if not adm_caller:
+        _deny_access(user_id)
+        return
+
     state = user_states.get(user_id)
     text = message.text.strip()
 
-    if state == "WAITING_NICK":
-        clean_input = text.replace(" ", "_")
-        adm = staff_mgr.search_by_nick(clean_input)
-        if adm:
-            db_set_link(user_id, adm["nick"], username)
-            user_states.pop(user_id, None)
-            kb = get_main_keyboard(user_id, adm)
-            success_text = (
-                f"✅ <b>Отлично!</b> Твой Telegram успешно привязан к нику <b>{adm['nick']}</b>.\n\n"
-                f"Теперь ты можешь в любой момент нажать кнопку <b>[📊 Моя статистика]</b>."
-            )
-            _safe_send_message(user_id, success_text, reply_markup=kb)
-            
-            # Send stats card right away
-            card = staff_mgr.format_card(adm)
-            card += f"\n\n🕒 <i>Синхронизировано: {staff_mgr.last_update_str}</i>"
-            _safe_send_message(user_id, card, reply_markup=get_card_inline_keyboard())
-        else:
-            _safe_send_message(
-                user_id,
-                f"❌ Администратор с ником <code>{clean_input}</code> не найден в таблице.\n\n"
-                f"Проверь регистр и правильность написания (например: <code>Ivan_Ivanov</code>) и попробуй ещё раз:"
-            )
-        return
-
-    elif state == "WAITING_SEARCH":
+    if state == "WAITING_SEARCH":
         user_states.pop(user_id, None)
+        if not is_senior_admin(user_id, adm_caller):
+            return
         adm = staff_mgr.search_by_nick(text)
         if adm:
             card = staff_mgr.format_card(adm)
-            card += f"\n\n🕒 <i>Данные из таблицы: {staff_mgr.last_update_str}</i>"
+            card += f"\n\n🕒 <i>Последнее обновление таблицы: {staff_mgr.last_update_str}</i>"
             _safe_send_message(user_id, card)
         else:
             _safe_send_message(user_id, f"❌ Администратор с ником <code>{text}</code> не найден в таблице.")
         return
 
-    # Default fallback
-    adm = staff_mgr.find_admin_for_telegram_user(user_id, username)
-    if adm:
-        kb = get_main_keyboard(user_id, adm)
-        _safe_send_message(user_id, "Выбери действие на клавиатуре ниже 👇", reply_markup=kb)
-    else:
-        user_states[user_id] = "WAITING_NICK"
-        _safe_send_message(
-            user_id,
-            "⚠️ Твой аккаунт ещё не привязан к нику.\n"
-            "Пожалуйста, отправь свой точный никнейм (например: <code>Ivan_Ivanov</code>):"
-        )
+    # Default fallback for authorized user
+    kb = get_main_keyboard(user_id, adm_caller)
+    _safe_send_message(user_id, "Выбери действие на клавиатуре ниже 👇", reply_markup=kb)
+
+@bot.message_handler(func=lambda msg: True)
+def handle_other_content(message):
+    user_id = message.from_user.id
+    adm = staff_mgr.find_admin_for_telegram_user(user_id, message.from_user.username)
+    if not adm:
+        _deny_access(user_id)
+        return
+    kb = get_main_keyboard(user_id, adm)
+    _safe_send_message(user_id, "Используй кнопку ниже 👇", reply_markup=kb)
 
 # Background auto-refresher
 def background_sync_worker():
