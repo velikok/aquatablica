@@ -237,11 +237,11 @@ class StaffDataManager:
                 last_prom = excel_date_to_str(r.get(15))
                 appointed = excel_date_to_str(r.get(16))
                 
-                # Telegram metadata (safe None handling)
-                val_44 = r.get(44)
-                tg_username = str(val_44).strip().lstrip('@') if val_44 is not None else ""
+                # Telegram metadata (Col 45 - TG Username, Col 46 - TG ID)
                 val_45 = r.get(45)
-                raw_tg_id = str(val_45).strip() if val_45 is not None else ""
+                tg_username = str(val_45).strip().lstrip('@') if val_45 is not None else ""
+                val_46 = r.get(46)
+                raw_tg_id = str(val_46).strip() if val_46 is not None else ""
                 clean_tg_id = ""
                 if raw_tg_id and raw_tg_id != '-':
                     try:
@@ -297,9 +297,24 @@ class StaffDataManager:
             return False, str(e)
 
     def find_admin_for_telegram_user(self, telegram_id, telegram_username=None):
-        """Строгая проверка доступа: ТОЛЬКО по точному совпадению TG ID в таблице."""
+        """Проверка доступа по точному совпадению TG ID или Username в таблице."""
         str_id = str(telegram_id)
-        return self.admins_by_tg_id.get(str_id)
+        # 1. Поиск по точному Telegram ID
+        if str_id in self.admins_by_tg_id:
+            return self.admins_by_tg_id[str_id]
+            
+        # 2. Поиск по Telegram username (без @)
+        if telegram_username:
+            clean_uname = str(telegram_username).strip().lstrip('@').lower()
+            if clean_uname in self.admins_by_username:
+                return self.admins_by_username[clean_uname]
+                
+        # 3. Проверка через привязанный ник в БД staff.db
+        linked_nick = db_get_linked_nick(telegram_id)
+        if linked_nick and linked_nick.lower() in self.admins_by_nick:
+            return self.admins_by_nick[linked_nick.lower()]
+            
+        return None
 
     def search_by_nick(self, query):
         clean_q = query.strip().lower()
